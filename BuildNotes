@@ -1,0 +1,39 @@
+Short version:
+Make sure that OSLib has been seen.
+Make sure that zlib is exported.
+Run Mk to build the SQLite library.
+Run MkShell to build the command-line shell.
+
+Long version:
+SQLite uses an "amalgamation" where many separate files are combined into a
+single C source file. See https://www.sqlite.org/amalgamation.html for
+details.
+
+This port uses the same idea. There is a little utility called "amalgamate"
+which takes the untouched SQLite amalgamation, and copies in the
+RISC OS-specific stuff from the os_riscos file.
+
+When you run Mk it'll automatically run amalgamate then build the
+amalgamated version.
+
+MkShell uses the MakeShell makefile to build the shell. I suspect that it's
+probably possible to get this all working from a single makefile using
+multiple targets, but I'm not an AMU expert. If anyone can advise how to get
+this working then I'm all ears.
+
+The shell relies on zlib. This isn't supplied with the DDE, so you will need
+to put it in the Export.APCS-32.Lib directory yourself.
+
+The c directory contains the following files:
+amalgamate  - The code for the amalgamation utility
+os_riscos   - The RISC OS-specific "VFS" for SQLite
+shell       - The command-line shell, with RISC OS-specific tweaks
+sqlite3-in  - The untouched sqlite3.c file from the official SQLite
+              distribution
+sqlite3     - The resulting amalgamation (after running Mk or amalgamate)
+
+The h directory contains:
+sqlite3     - The untouched sqlite3.h file from the official SQLite
+              distribution
+sqlite3ext  - The untouched sqlite3ext.h file from the official SQLite
+              distribution (not currently used)

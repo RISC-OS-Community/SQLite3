@@ -1,0 +1,6 @@
+Dir <Obey$Dir>
+WimpSlot -min 2048k
+CDir o
+cc amalgamate
+amalgamate
+amu THROWBACK=-throwback

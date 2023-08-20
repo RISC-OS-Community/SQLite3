@@ -1,0 +1,1080 @@
+/*
+** 2004 May 22
+**
+** The author disclaims copyright to this source code.  In place of
+** a legal notice, here is a blessing:
+**
+**    May you do good and not evil.
+**    May you find forgiveness for yourself and forgive others.
+**    May you share freely, never taking more than you give.
+**
+******************************************************************************
+**
+** This file contains code that is specific to RISC OS systems.
+*/
+#if __riscos              /* This file is used on RISC OS only */
+
+/*
+** standard include files.
+*/
+#include <time.h>
+#include <errno.h>
+#include <stdio.h>
+#include "swis.h"
+#include "oslib/osfile.h"
+#include "oslib/osfscontrol.h"
+#include "oslib/osfind.h"
+#include "oslib/osgbpb.h"
+#include "oslib/osargs.h"
+
+/*
+** Maximum supported path-length.
+*/
+#define MAX_PATHNAME 512
+
+/*
+** The riscosFile structure is subclass of sqlite3_file specific to the RISC OS
+** VFS implementations.
+*/
+typedef struct riscosFile riscosFile;
+struct riscosFile {
+  sqlite3_io_methods const *pMethod;    /* Always the first entry */
+  sqlite3_vfs *pVfs;                    /* The VFS that created this riscosFile */
+  int h;                                /* The file descriptor */
+  unsigned char eFileLock;              /* The type of lock held on this fd */
+  unsigned short int ctrlFlags;         /* Behavioural bits.  RISCOSFILE_* flags */
+  int lastErrno;                        /* The RISC OS errnum from last I/O error */
+  int szChunk;                          /* Configured by FCNTL_CHUNK_SIZE */
+  int deleteOnClose;                    /* True if file is to be deleted when closing */
+
+#ifdef SQLITE_TEST
+  /* In test mode, increase the size of this structure a bit so that 
+  ** it is larger than the struct CrashFile defined in test6.c.
+  */
+  char aPadding[32];
+#endif
+};
+
+typedef struct riscosVfsAppData riscosVfsAppData;
+struct riscosVfsAppData {
+  const sqlite3_io_methods *pMethod; /* The file I/O methods to use. */
+  void *pAppData;                    /* The extra pAppData, if any. */
+  int bNoLock;                       /* Non-zero if locking is disabled. */
+};
+
+/*
+** Allowed values for the riscosFile.ctrlFlags bitmask:
+*/
+#define RISCOSFILE_EXCL        0x01     /* Connections from one process only */
+#define RISCOSFILE_RDONLY      0x02     /* Connection is read only */
+#define RISCOSFILE_PERSIST_WAL 0x04     /* Persistent WAL mode */
+#ifndef SQLITE_DISABLE_DIRSYNC
+# define RISCOSFILE_DIRSYNC    0x08     /* Directory sync needed */
+#else
+# define RISCOSFILE_DIRSYNC    0x00
+#endif
+#define RISCOSFILE_PSOW        0x10     /* SQLITE_IOCAP_POWERSAFE_OVERWRITE */
+#define RISCOSFILE_DELETE      0x20     /* Delete on close */
+#define RISCOSFILE_URI         0x40     /* Filename might have query parameters */
+#define RISCOSFILE_NOLOCK      0x80     /* Do no file locking */
+
+/*
+** Include code that is common to all os_*.c files
+*/
+#include "os_common.h"
+
+
+/*
+** Helper functions to obtain and relinquish the global mutex. The
+** global mutex is used to protect the riscosInodeInfo object
+** used by this file, all of which may be shared by multiple threads.
+**
+** Function riscosMutexHeld() is used to assert() that the global mutex 
+** is held when required. This function is only used as part of assert() 
+** statements. e.g.
+**
+**   riscosEnterMutex()
+**     assert( riscosMutexHeld() );
+**   riscosEnterLeave()
+**
+** To prevent deadlock, the global riscosBigLock must must be acquired
+** before the riscosInodeInfo.pLockMutex mutex, if both are held.  It is
+** OK to get the pLockMutex without holding riscosBigLock first, but if
+** that happens, the riscosBigLock mutex must not be acquired until after
+** pLockMutex is released.
+**
+**      OK:     enter(riscosBigLock),  enter(pLockInfo)
+**      OK:     enter(riscosBigLock)
+**      OK:     enter(pLockInfo)
+**   ERROR:     enter(pLockInfo), enter(riscosBigLock)
+*/
+static sqlite3_mutex *riscosBigLock = 0;
+static void riscosEnterMutex(void){
+  assert( sqlite3_mutex_notheld(riscosBigLock) );  /* Not a recursive mutex */
+  sqlite3_mutex_enter(riscosBigLock);
+}
+static void riscosLeaveMutex(void){
+  assert( sqlite3_mutex_held(riscosBigLock) );
+  sqlite3_mutex_leave(riscosBigLock);
+}
+#ifdef SQLITE_DEBUG
+static int riscosMutexHeld(void) {
+  return sqlite3_mutex_held(riscosBigLock);
+}
+#endif
+
+
+#ifdef SQLITE_HAVE_OS_TRACE
+/*
+** Helper function for printing out trace information from debugging
+** binaries. This returns the string representation of the supplied
+** integer lock-type.
+*/
+static const char *azFileLock(int eFileLock){
+  switch( eFileLock ){
+    case NO_LOCK: return "NONE";
+    case SHARED_LOCK: return "SHARED";
+    case RESERVED_LOCK: return "RESERVED";
+    case PENDING_LOCK: return "PENDING";
+    case EXCLUSIVE_LOCK: return "EXCLUSIVE";
+  }
+  return "ERROR";
+}
+#endif
+
+/*
+** Set the pFile->lastErrno.  Do this in a subroutine as that provides
+** a convenient place to set a breakpoint.
+*/
+static void storeLastErrno(riscosFile *pFile, int error){
+  pFile->lastErrno = error;
+}
+
+/*
+** Return TRUE if pFile has been renamed or unlinked since it was first opened.
+*/
+static int fileHasMoved(riscosFile *pFile){
+  return 0;
+}
+
+static int riscosCheckReservedLock(sqlite3_file *NotUsed, int *pResOut){
+  UNUSED_PARAMETER(NotUsed);
+  *pResOut = 0;
+  return SQLITE_OK;
+}
+
+static int riscosLock(sqlite3_file *NotUsed, int NotUsed2){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  return SQLITE_OK;
+}
+
+static int riscosUnlock(sqlite3_file *NotUsed, int NotUsed2){
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  return SQLITE_OK;
+}
+
+/* Forward reference */
+static int riscosDelete(sqlite3_vfs*, const char*, int);
+static int riscosAccess(sqlite3_vfs*, const char*, int, int*);
+static int riscosFullPathname(sqlite3_vfs*, const char*, int, char*);
+
+/*
+** Get filename from handle.
+** Must sqlite3_free() the result.
+*/
+static char *riscosCanonicalise(int h){
+  int length;
+  _swi(OS_Args, _INR(0,2)|_IN(5)|_OUT(5), OSArgs_ReadPath, h, 0, 0, &length);
+  char *fileName = sqlite3_malloc(1 - length);
+
+  _swi(OS_Args, _INR(0,2)|_IN(5), OSArgs_ReadPath, h, (int)fileName, 1 - length);
+  return fileName;
+}
+
+/*
+** Close the file.
+*/
+static int riscosClose(sqlite3_file *id){
+  riscosFile *pFile = (riscosFile *)id;
+
+  /* Get canonicalised name while file still open */
+  char *fileName = riscosCanonicalise(pFile->h); 
+
+  /* Close file */
+  _swi(OS_Find, _INR(0,1), OSFind_Close, pFile->h);
+
+  if( pFile->deleteOnClose ){
+    riscosDelete(NULL, fileName, 0);
+  }
+  sqlite3_free(fileName);
+  memset(pFile, 0, sizeof(riscosFile));
+  return SQLITE_OK;
+}
+
+/******************************************************************************
+**************** Non-locking sqlite3_file methods *****************************
+**
+** The next division contains implementations for all methods of the 
+** sqlite3_file object other than the locking methods.  The locking
+** methods were defined in divisions above (one locking method per
+** division).  Those methods that are common to all locking modes
+** are gather together into this division.
+*/
+
+/*
+** Seek to the offset passed as the second argument, then read cnt 
+** bytes into pBuf. Return the number of bytes actually read.
+*/
+static int seekAndRead(riscosFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
+  int got;
+  TIMER_START;
+  assert( cnt==(cnt&0x1ffff) );
+  assert( id->h>2 );
+
+  int remain;
+  _swi(OS_GBPB, _INR(0,4)|_OUT(3), OSGBPB_ReadAt, id->h, (int)pBuf, cnt, (int)offset, &remain);
+  got = cnt - remain;
+
+  TIMER_END;
+  OSTRACE(("READ    %-3d %5d %7lld %llu\n",
+            id->h, got, offset, TIMER_ELAPSED));
+  return got;
+}
+
+/*
+** Read data from a file into a buffer.  Return SQLITE_OK if all
+** bytes were read successfully and SQLITE_IOERR if anything goes
+** wrong.
+*/
+static int riscosRead(
+  sqlite3_file *id,
+  void *pBuf,
+  int amt,
+  sqlite3_int64 offset
+){
+  riscosFile *pFile = (riscosFile *)id;
+  int got;
+  assert( id );
+  assert( offset>=0 );
+  assert( amt>0 );
+
+  got = seekAndRead(pFile, offset, pBuf, amt);
+  if( got==amt ){
+    return SQLITE_OK;
+  }else if( got<0 ){
+    return SQLITE_IOERR_READ;
+  }else{
+    /* Unread parts of the buffer must be zero-filled */
+    memset(&((char*)pBuf)[got], 0, amt-got);
+    return SQLITE_IOERR_SHORT_READ;
+  }
+}
+
+/*
+** Attempt to seek the file-descriptor passed as the first argument to
+** absolute offset iOff, then attempt to write nBuf bytes of data from
+** pBuf to it. If an error occurs, return -1 and set *piErrno. Otherwise, 
+** return the actual number of bytes written.
+*/
+static int seekAndWriteFd(
+  int fd,                         /* File descriptor to write to */
+  i64 iOff,                       /* File offset to begin writing at */
+  const void *pBuf,               /* Copy data from this buffer to the file */
+  int nBuf,                       /* Size of buffer pBuf in bytes */
+  int *piErrno                    /* OUT: Error number if error occurs */
+){
+  assert( nBuf==(nBuf&0x1ffff) );
+  assert( fd>2 );
+  assert( piErrno!=0 );
+  nBuf &= 0x1ffff;
+  TIMER_START;
+
+  _kernel_oserror *err;
+  err = _swix(OS_GBPB, _INR(0,4), OSGBPB_WriteAt, fd, (int)pBuf, nBuf, (int)iOff);
+
+  TIMER_END;
+  OSTRACE(("WRITE   %-3d %5d %7lld %llu\n", fd, rc, iOff, TIMER_ELAPSED));
+
+  if( err!=NULL ){
+    *piErrno = err->errnum;
+    return -1;
+  }
+  return nBuf;
+}
+
+
+/*
+** Seek to the offset in id->offset then read cnt bytes into pBuf.
+** Return the number of bytes actually read.  Update the offset.
+**
+** To avoid stomping the errno value on a failed write the lastErrno value
+** is set before returning.
+*/
+static int seekAndWrite(riscosFile *id, i64 offset, const void *pBuf, int cnt){
+  return seekAndWriteFd(id->h, offset, pBuf, cnt, &id->lastErrno);
+}
+
+
+/*
+** Write data from a buffer into a file.  Return SQLITE_OK on success
+** or some other error code on failure.
+*/
+static int riscosWrite(
+  sqlite3_file *id,
+  const void *pBuf,
+  int amt,
+  sqlite3_int64 offset
+){
+  riscosFile *pFile = (riscosFile*)id;
+  int wrote = 0;
+  assert( id );
+  assert( amt>0 );
+
+  while( (wrote = seekAndWrite(pFile, offset, pBuf, amt))<amt && wrote>0 ){
+    amt -= wrote;
+    offset += wrote;
+    pBuf = &((char*)pBuf)[wrote];
+  }
+  SimulateIOError(( wrote=(-1), amt=1 ));
+  SimulateDiskfullError(( wrote=0, amt=1 ));
+
+  if( amt>wrote ){
+    if( wrote<0 ){
+      /* lastErrno set by seekAndWrite */
+      return SQLITE_IOERR_WRITE;
+    }
+  }
+
+  return SQLITE_OK;
+}
+
+/*
+** Make sure all writes to a particular file are committed to disk.
+*/
+static int riscosSync(sqlite3_file *id, int flags){
+  riscosFile *pFile = (riscosFile *)id;
+  assert( pFile );
+
+  if( _swix(OS_Args, _INR(0,1), OSArgs_Ensure, pFile->h) != NULL){
+    return SQLITE_IOERR_FSYNC;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Truncate an open file to a specified size
+*/
+static int riscosTruncate(sqlite3_file *id, i64 nByte){
+  riscosFile *pFile = (riscosFile *)id;
+  assert( pFile );
+  SimulateIOError( return SQLITE_IOERR_TRUNCATE );
+
+  /* If the user has configured a chunk-size for this file, truncate the
+  ** file so that it consists of an integer number of chunks (i.e. the
+  ** actual file size after the operation may be larger than the requested
+  ** size).
+  */
+  if( pFile->szChunk>0 ){
+    nByte = ((nByte + pFile->szChunk - 1)/pFile->szChunk) * pFile->szChunk;
+  }
+
+  _kernel_oserror *err;
+  err = _swix(OS_Args, _INR(0,2), OSArgs_SetExt, pFile->h, (int)nByte);
+
+  if( err!=NULL ){
+    storeLastErrno(pFile, err->errnum);
+    return SQLITE_IOERR_TRUNCATE;
+  }else{
+    return SQLITE_OK;
+  }
+}
+
+/*
+** Determine the current size of a file in bytes
+*/
+static int riscosFileSize(sqlite3_file *id, i64 *pSize){
+  riscosFile *pFile = (riscosFile *)id;
+  assert( pFile );
+
+  _kernel_oserror *err;
+  int size;
+  err = _swix(OS_Args, _INR(0,1)|_OUT(2), OSArgs_ReadExt, pFile->h, &size);
+
+  if( err!=NULL ){
+    storeLastErrno((riscosFile*)id, err->errnum);
+    return SQLITE_IOERR_FSTAT;
+  }
+  *pSize = size;
+
+  return SQLITE_OK;
+}
+
+/*
+** This function is called to handle the SQLITE_FCNTL_SIZE_HINT
+** file-control operation.  Enlarge the database to nBytes in size
+** (rounded up to the next chunk-size).  If the database is already
+** nBytes or larger, this routine is a no-op.
+*/
+static int fcntlSizeHint(riscosFile *pFile, i64 nByte){
+  if( pFile->szChunk>0 ){
+    i64 nSize;                    /* Required file size */
+
+    nSize = ((nByte+pFile->szChunk-1) / pFile->szChunk) * pFile->szChunk;
+    if( _swix(OS_Args, _INR(0,2), OSArgs_SetExt, pFile->h, (int)nSize) != NULL ){
+      return SQLITE_IOERR_WRITE;
+    }
+  }
+
+  return SQLITE_OK;
+}
+
+/*
+** If *pArg is initially negative then this is a query.  Set *pArg to
+** 1 or 0 depending on whether or not bit mask of pFile->ctrlFlags is set.
+**
+** If *pArg is 0 or 1, then clear or set the mask bit of pFile->ctrlFlags.
+*/
+static void riscosModeBit(riscosFile *pFile, unsigned char mask, int *pArg){
+  if( *pArg<0 ){
+    *pArg = (pFile->ctrlFlags & mask)!=0;
+  }else if( (*pArg)==0 ){
+    pFile->ctrlFlags &= ~mask;
+  }else{
+    pFile->ctrlFlags |= mask;
+  }
+}
+
+/* Forward declaration */
+static int riscosGetTempname(int nBuf, char *zBuf);
+#ifndef SQLITE_OMIT_WAL
+ static int riscosFcntlExternalReader(riscosFile*, int*);
+#endif
+
+/*
+** Information and control of an open file handle.
+*/
+static int riscosFileControl(sqlite3_file *id, int op, void *pArg){
+  riscosFile *pFile = (riscosFile*)id;
+  switch( op ){
+    case SQLITE_FCNTL_LOCKSTATE: {
+      *(int*)pArg = pFile->eFileLock;
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_LAST_ERRNO: {
+      *(int*)pArg = pFile->lastErrno;
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_CHUNK_SIZE: {
+      pFile->szChunk = *(int *)pArg;
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_SIZE_HINT: {
+      int rc;
+      SimulateIOErrorBenign(1);
+      rc = fcntlSizeHint(pFile, *(i64 *)pArg);
+      SimulateIOErrorBenign(0);
+      return rc;
+    }
+    case SQLITE_FCNTL_PERSIST_WAL: {
+      riscosModeBit(pFile, RISCOSFILE_PERSIST_WAL, (int*)pArg);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_POWERSAFE_OVERWRITE: {
+      riscosModeBit(pFile, RISCOSFILE_PSOW, (int*)pArg);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_VFSNAME: {
+      *(char**)pArg = sqlite3_mprintf("%s", pFile->pVfs->zName);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_TEMPFILENAME: {
+      char *zTFile = sqlite3_malloc64( pFile->pVfs->mxPathname );
+      if( zTFile ){
+        riscosGetTempname(pFile->pVfs->mxPathname, zTFile);
+        *(char**)pArg = zTFile;
+      }
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_HAS_MOVED: {
+      *(int*)pArg = fileHasMoved(pFile);
+      return SQLITE_OK;
+    }
+    case SQLITE_FCNTL_EXTERNAL_READER: {
+#ifndef SQLITE_OMIT_WAL
+      return riscosFcntlExternalReader((riscosFile*)id, (int*)pArg);
+#else
+      *(int*)pArg = 0;
+      return SQLITE_OK;
+#endif
+    }
+  }
+  return SQLITE_NOTFOUND;
+}
+
+/*
+** Return the sector size in bytes of the underlying block device for
+** the specified file. This is almost always 512 bytes, but may be
+** larger for some devices.
+**
+** SQLite code assumes this function cannot fail. It also assumes that
+** if two files are created in the same file-system directory (i.e.
+** a database and its journal file) that the sector size will be the
+** same for both.
+*/
+static int riscosSectorSize(sqlite3_file *id){
+  riscosFile *pFile = (riscosFile*)id;
+  char *fileName = riscosCanonicalise(pFile->h);
+
+  int size;
+  _kernel_oserror *e;
+  e = _swix(OS_File, _INR(0,1)|_OUT(2), OSFile_ReadBlockSize, (int)fileName, &size);
+  sqlite3_free(fileName);
+
+  if( e != NULL ){
+    return size;
+  }
+  else{
+    return SQLITE_DEFAULT_SECTOR_SIZE;
+  }
+}
+
+/*
+** Return the device characteristics for the file. This is always 0.
+*/
+static int riscosDeviceCharacteristics(sqlite3_file *id){
+  return 0;
+}
+
+static int riscosFcntlExternalReader(riscosFile *pFile, int *piOut){
+  return 0;
+}
+
+/*
+** If possible, return a pointer to a mapping of file fd starting at offset
+** iOff. The mapping must be valid for at least nAmt bytes.
+**
+** If such a pointer can be obtained, store it in *pp and return SQLITE_OK.
+** Or, if one cannot but no error occurs, set *pp to 0 and return SQLITE_OK.
+** Finally, if an error does occur, return an SQLite error code. The final
+** value of *pp is undefined in this case.
+**
+** If this function does return a pointer, the caller must eventually 
+** release the reference by calling riscosUnfetch().
+*/
+static int riscosFetch(sqlite3_file *fd, i64 iOff, int nAmt, void **pp){
+  *pp = 0;
+
+  return SQLITE_OK;
+}
+
+/*
+** If the third argument is non-NULL, then this function releases a 
+** reference obtained by an earlier call to riscosFetch(). The second
+** argument passed to this function must be the same as the corresponding
+** argument that was passed to the riscosFetch() invocation. 
+**
+** Or, if the third argument is NULL, then this function is being called 
+** to inform the VFS layer that, according to POSIX, any existing mapping 
+** may now be invalid and should be unmapped.
+*/
+static int riscosUnfetch(sqlite3_file *fd, i64 iOff, void *p){
+  UNUSED_PARAMETER(fd);
+  UNUSED_PARAMETER(p);
+  UNUSED_PARAMETER(iOff);
+  return SQLITE_OK;
+}
+
+/*
+** Here ends the implementation of all sqlite3_file methods.
+**
+********************** End sqlite3_file Methods *******************************
+******************************************************************************/
+
+/*
+** This vector defines all the methods that can operate on an sqlite3_file
+** for riscos.
+*/
+static const sqlite3_io_methods riscosIoMethod = {
+  3,                        /* iVersion */
+  riscosClose,
+  riscosRead,
+  riscosWrite,
+  riscosTruncate,
+  riscosSync,
+  riscosFileSize,
+  riscosLock,
+  riscosUnlock,
+  riscosCheckReservedLock,
+  riscosFileControl,
+  riscosSectorSize,
+  riscosDeviceCharacteristics,
+  0,
+  0,
+  0,
+  0,
+  riscosFetch,
+  riscosUnfetch,
+};
+
+static riscosVfsAppData riscosAppData = {
+  &riscosIoMethod,    /* pMethod */
+  0,                  /* pAppData */
+  1                   /* bNoLock */
+};
+
+
+/****************************************************************************
+**************************** sqlite3_vfs methods ****************************
+**
+** This division contains the implementation of methods on the
+** sqlite3_vfs object.
+*/
+
+/*
+** Initialise the contents of the riscosFile structure pointed to by pId.
+*/
+static int fillInRiscOSFile(
+  sqlite3_vfs *pVfs,      /* Pointer to vfs object */
+  int h,                  /* Open file descriptor of file being opened */
+  sqlite3_file *pId,      /* Write to the riscosFile structure here */
+  int ctrlFlags,          /* Zero or more RISCOSFILE_* values */
+  int deleteOnClose       /* Whether to delete the file when closed */
+){
+  riscosFile *pNew = (riscosFile *)pId;
+  int rc = SQLITE_OK;
+
+  assert( pNew->pInode==NULL );
+
+  OSTRACE(("OPEN    %-3d %s\n", h, zFilename));
+  pNew->h = h;
+  pNew->pVfs = pVfs;
+  pNew->ctrlFlags = (u8)ctrlFlags;
+  pNew->pMethod = &riscosIoMethod;
+  pNew->deleteOnClose = deleteOnClose;
+  OpenCounter(+1);
+  return rc;
+}
+
+/*
+** Create a temporary file name in zBuf.  zBuf must be allocated
+** by the calling process and must be big enough to hold at least
+** pVfs->mxPathname bytes.
+*/
+static int riscosGetTempname(int nBuf, char *zBuf){
+  const char *zDir;
+  int iLimit = 0;
+  int rc = SQLITE_OK;
+
+  /* It's odd to simulate an io-error here, but really this is just
+  ** using the io-error infrastructure to test that SQLite handles this
+  ** function failing.
+  */
+  zBuf[0] = 0;
+  SimulateIOError( return SQLITE_IOERR );
+
+  sqlite3_mutex_enter(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_TEMPDIR));
+  zDir = "<Wimp$ScrapDir>.SQLite";
+
+  /* Create SQLite directory in Scrap if it doesn't already exist */
+  _swi(OS_File, _INR(0,2)|_IN(4), OSFile_CreateDir, (int)zDir, 0);
+  
+  int type;
+  do{
+    u64 r;
+    sqlite3_randomness(sizeof(r), &r);
+    assert( nBuf>2 );
+    zBuf[nBuf-2] = 0;
+    sqlite3_snprintf(nBuf, zBuf, "%s.%llx%c",
+                     zDir, r, 0);
+    if( zBuf[nBuf-2]!=0 || (iLimit++)>10 ){
+      rc = SQLITE_ERROR;
+      break;
+    }
+    _swi(OS_File, _INR(0,1)|_OUT(0), OSFile_ReadStampedNoPath, (int)zBuf, &type);
+  }while( type>0 );
+  sqlite3_mutex_leave(sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_TEMPDIR));
+  return rc;
+}
+
+/*
+** Open the file zPath.
+** 
+** Previously, the SQLite OS layer used three functions in place of this
+** one:
+**
+**     sqlite3OsOpenReadWrite();
+**     sqlite3OsOpenReadOnly();
+**     sqlite3OsOpenExclusive();
+**
+** These calls correspond to the following combinations of flags:
+**
+**     ReadWrite() ->     (READWRITE | CREATE)
+**     ReadOnly()  ->     (READONLY) 
+**     OpenExclusive() -> (READWRITE | CREATE | EXCLUSIVE)
+**
+** The old OpenExclusive() accepted a boolean argument - "delFlag". If
+** true, the file was configured to be automatically deleted when the
+** file handle closed. To achieve the same effect using this new 
+** interface, add the DELETEONCLOSE flag to those specified above for 
+** OpenExclusive().
+*/
+static int riscosOpen(
+  sqlite3_vfs *pVfs, 
+  const char *zPath, 
+  sqlite3_file *pFile,
+  int flags,
+  int *pOutFlags
+){
+  riscosFile f;                  /* File returned by OS_Find */
+  int oaction = 0;               /* Reason code to pass to OS_Find */
+  int rc = SQLITE_OK;
+
+  int isExclusive  = (flags & SQLITE_OPEN_EXCLUSIVE);
+  int isDelete     = (flags & SQLITE_OPEN_DELETEONCLOSE);
+  int isCreate     = (flags & SQLITE_OPEN_CREATE);
+  int isReadonly   = (flags & SQLITE_OPEN_READONLY);
+  int isReadWrite  = (flags & SQLITE_OPEN_READWRITE);
+
+  /* If argument zPath is a NULL pointer, this function is required to open
+  ** a temporary file. Use this buffer to store the file name in.
+  */
+  char zTmpname[MAX_PATHNAME+2];
+  const char *zName = zPath;
+
+  /* Check the following statements are true: 
+  **
+  **   (a) Exactly one of the READWRITE and READONLY flags must be set, and 
+  **   (b) if CREATE is set, then READWRITE must also be set, and
+  **   (c) if EXCLUSIVE is set, then CREATE must also be set.
+  **   (d) if DELETEONCLOSE is set, then CREATE must also be set.
+  */
+  assert((isReadonly==0 || isReadWrite==0) && (isReadWrite || isReadonly));
+  assert(isCreate==0 || isReadWrite);
+  assert(isExclusive==0 || isCreate);
+  assert(isDelete==0 || isCreate);
+
+
+  /* The main DB, main journal, and master journal are never automatically
+  ** deleted. Nor are they ever temporary files.  */
+  assert( (!isDelete && zName) || eType!=SQLITE_OPEN_MAIN_DB );
+  assert( (!isDelete && zName) || eType!=SQLITE_OPEN_MAIN_JOURNAL );
+  assert( (!isDelete && zName) || eType!=SQLITE_OPEN_SUPER_JOURNAL );
+  assert( (!isDelete && zName) || eType!=SQLITE_OPEN_WAL );
+
+  /* Assert that the upper layer has set one of the "file-type" flags. */
+  assert( eType==SQLITE_OPEN_MAIN_DB      || eType==SQLITE_OPEN_TEMP_DB
+       || eType==SQLITE_OPEN_MAIN_JOURNAL || eType==SQLITE_OPEN_TEMP_JOURNAL
+       || eType==SQLITE_OPEN_SUBJOURNAL   || eType==SQLITE_OPEN_SUPER_JOURNAL
+       || eType==SQLITE_OPEN_TRANSIENT_DB || eType==SQLITE_OPEN_WAL
+  );
+  
+#ifdef SQLITE_ASSERT_NO_FILES
+  /* Applications that never read or write a persistent disk files */
+  assert( zName==0 );
+#endif
+
+  int type;
+  _swi(OS_File, _INR(0,1)|_OUT(0), OSFile_ReadStampedNoPath, (int)zName, &type);
+  int fileExists = type>0;
+
+  if( isReadonly ) {
+    oaction |= OSFind_Openin;
+  }
+  else {
+    if ( isCreate && !fileExists ) {
+      oaction |= OSFind_Openout;
+    } else {
+      oaction |= OSFind_Openup;
+    }
+  }
+  oaction |= osfind_NO_PATH;
+
+  memset(pFile, 0, sizeof(riscosFile));
+  if( isExclusive && fileExists ) {
+    return SQLITE_CANTOPEN_BKPT;
+  }
+
+  if( !zName ){
+    /* If zName is NULL, the upper layer is requesting a temp file. */
+    assert(isDelete && !isNewJrnl);
+    rc = riscosGetTempname(pVfs->mxPathname, zTmpname);
+    if( rc!=SQLITE_OK ){
+      return rc;
+    }
+    zName = zTmpname;
+
+    /* Generated temporary filenames are always double-zero terminated
+    ** for use by sqlite3_uri_parameter(). */
+    assert( zName[strlen(zName)+1]==0 );
+  }
+
+  int handle;
+  _swi(OS_Find, _INR(0,1)|_OUT(0), oaction, (int)zName, &handle);
+
+  f.h = handle;
+  f.deleteOnClose = isDelete;
+
+  if( isCreate ){
+    _swi(OS_File, _INR(0,2), OSFile_SetType, (int)zName, 0xa70);
+  }
+
+  if( f.h==0 && isReadWrite && !isExclusive ){
+    /* Failed to open the file for read/write access. Try read-only. */
+    flags &= ~(SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE);
+    flags |= SQLITE_OPEN_READONLY;
+    return riscosOpen(pVfs, zName, pFile, flags, pOutFlags);
+  }
+  if( f.h==0 ){
+    return SQLITE_CANTOPEN;
+  }
+  if( pOutFlags ){
+    *pOutFlags = flags;
+  }
+  rc = fillInRiscOSFile(pVfs, f.h, pFile, 0, isDelete);
+
+  return rc;
+}
+
+/*
+** Delete the file at zPath.
+*/
+static int riscosDelete(
+  sqlite3_vfs *NotUsed,     /* VFS containing this as the xDelete method */
+  const char *zPath,        /* Name of file to be deleted */
+  int NotUsed2              /* If true, fsync() directory after deleting file */
+){
+  int rc = SQLITE_OK;
+  UNUSED_PARAMETER2(NotUsed, NotUsed2);
+  SimulateIOError(return SQLITE_IOERR_DELETE);
+
+  _kernel_oserror *err;
+  err = _swix(OS_File, _INR(0,1), OSFile_Delete, (int)zPath);
+
+  if( err!=NULL ){
+    rc = SQLITE_IOERR_DELETE;
+  }
+  return rc;
+}
+
+/*
+** Test the existence of or access permissions of file zPath. The
+** test performed depends on the value of flags:
+**
+**     SQLITE_ACCESS_EXISTS: Return 1 if the file exists
+**     SQLITE_ACCESS_READWRITE: Return 1 if the file is read and writable.
+**     SQLITE_ACCESS_READONLY: Return 1 if the file is readable.
+**
+** Otherwise return 0.
+*/
+static int riscosAccess(
+  sqlite3_vfs *NotUsed,   /* The VFS containing this xAccess method */
+  const char *zPath,      /* Path of the file to examine */
+  int flags,              /* What do we want to learn about the zPath file? */
+  int *pResOut            /* Write result boolean here */
+){
+  UNUSED_PARAMETER(NotUsed);
+  SimulateIOError( return SQLITE_IOERR_ACCESS; );
+  assert( pResOut!=0 );
+
+  /* The spec says there are three possible values for flags.  But only
+  ** two of them are actually used */
+  assert( flags==SQLITE_ACCESS_EXISTS || flags==SQLITE_ACCESS_READWRITE );
+
+  _kernel_oserror *err;
+  int type;
+  int attrs;
+  err = _swix(OS_File, _INR(0,1)|_OUT(0)|_OUT(5), OSFile_ReadStampedNoPath, (int)zPath, &type, &attrs);
+
+  if( err!=NULL ){
+    *pResOut = 0;
+  }
+  if( flags==SQLITE_ACCESS_EXISTS ){
+    *pResOut = !(type == osfile_NOT_FOUND);
+  }else{
+    *pResOut = attrs & (1 << fileswitch_ATTR_OWNER_READ) && attrs & (1 << fileswitch_ATTR_OWNER_WRITE);
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Turn a relative pathname into a full pathname. The relative path
+** is stored as a nul-terminated string in the buffer pointed to by
+** zPath. 
+**
+** zOut points to a buffer of at least sqlite3_vfs.mxPathname bytes 
+** (in this case, MAX_PATHNAME bytes). The full-path is written to
+** this buffer before returning.
+*/
+static int riscosFullPathname(
+  sqlite3_vfs *pVfs,            /* Pointer to vfs object */
+  const char *zPath,            /* Possibly relative input path */
+  int nOut,                     /* Size of output buffer in bytes */
+  char *zOut                    /* Output buffer */
+){
+  if( _swix(OS_FSControl, _INR(0,5), OSFSControl_CanonicalisePath, (int)zPath, (int)zOut, 0, 0, nOut)!=NULL ){
+    return SQLITE_CANTOPEN_BKPT;
+  }
+  return SQLITE_OK;
+}
+
+#define riscosDlOpen  0
+#define riscosDlError 0
+#define riscosDlSym   0
+#define riscosDlClose 0
+
+/*
+** Write nBuf bytes of random data to the supplied buffer zBuf.
+*/
+static int riscosRandomness(sqlite3_vfs *NotUsed, int nBuf, char *zBuf){
+  UNUSED_PARAMETER(NotUsed);
+  assert((size_t)nBuf>=(sizeof(time_t)+sizeof(int)));
+
+  /* When testing, initialising zBuf[] to zero is all we do.  That means
+  ** that we always use the same random number sequence.  This makes the
+  ** tests repeatable.
+  */
+  memset(zBuf, 0, nBuf);
+#if !defined(SQLITE_TEST)
+  {
+    time((time_t*)zBuf);
+  }
+#endif
+  return nBuf;
+}
+
+/*
+** Sleep for a little while.  Return the amount of time slept.
+** The argument is the number of microseconds we want to sleep.
+** The return value is the number of microseconds of sleep actually
+** requested from the underlying operating system, a number which
+** might be greater than or equal to the argument, but not less
+** than the argument.
+*/
+static int riscosSleep(sqlite3_vfs *NotUsed, int microseconds){
+  UNUSED_PARAMETER(NotUsed);
+  return microseconds; // TODO: Try to actually sleep if possible.
+}
+
+/*
+** The following variable, if set to a non-zero value, is interpreted as
+** the number of seconds since 1970 and is used to set the result of
+** sqlite3OsCurrentTime() during testing.
+*/
+#ifdef SQLITE_TEST
+int sqlite3_current_time = 0;
+#endif
+
+/*
+** Find the current time (in Universal Coordinated Time).  Write into *piNow
+** the current time and date as a Julian Day number times 86_400_000.  In
+** other words, write into *piNow the number of milliseconds since the Julian
+** epoch of noon in Greenwich on November 24, 4714 B.C according to the
+** proleptic Gregorian calendar.
+**
+** On success, return SQLITE_OK.  Return SQLITE_ERROR if the time and date 
+** cannot be found.
+*/
+static int riscosCurrentTimeInt64(sqlite3_vfs *NotUsed, sqlite3_int64 *piNow){
+  static const sqlite3_int64 riscosEpoch = 24405875*(sqlite3_int64)8640000;
+  int rc = SQLITE_OK;
+  time_t t;
+  time(&t);
+  *piNow = ((sqlite3_int64)t)*1000 + riscosEpoch;
+
+#ifdef SQLITE_TEST
+  if( sqlite3_current_time ){
+    *piNow = 1000*(sqlite3_int64)sqlite3_current_time + riscosEpoch;
+  }
+#endif
+  UNUSED_PARAMETER(NotUsed);
+  return rc;
+}
+
+#ifndef SQLITE_OMIT_DEPRECATED
+/*
+** Find the current time (in Universal Coordinated Time).  Write the
+** current time and date as a Julian Day number into *prNow and
+** return 0.  Return 1 if the time and date cannot be found.
+*/
+static int riscosCurrentTime(sqlite3_vfs *NotUsed, double *prNow){
+  sqlite3_int64 i = 0;
+  int rc;
+  UNUSED_PARAMETER(NotUsed);
+  rc = riscosCurrentTimeInt64(0, &i);
+  *prNow = i/86400000.0;
+  return rc;
+}
+#else
+# define riscosCurrentTime 0
+#endif
+
+/*
+** The xGetLastError() method is designed to return a better
+** low-level error message when operating-system problems come up
+** during SQLite operation.  Only the integer return code is currently
+** used.
+*/
+static int riscosGetLastError(sqlite3_vfs *NotUsed, int NotUsed2, char *NotUsed3){
+  UNUSED_PARAMETER(NotUsed);
+  UNUSED_PARAMETER(NotUsed2);
+  UNUSED_PARAMETER(NotUsed3);
+  return errno;
+}
+
+
+/*
+************************ End of sqlite3_vfs methods ***************************
+******************************************************************************/
+
+/*
+** Initialise the operating system interface.
+**
+** This routine registers the VFS implementation for RISC OS.
+** This routine, and the sqlite3_os_end() routine that follows,
+** should be the only routines in this file that are visible from other
+** files.
+**
+** This routine is called once during SQLite initialisation and by a
+** single thread.  The memory allocation and mutex subsystems have not
+** necessarily been initialised when this routine is called, and so they
+** should not be used.
+*/
+int sqlite3_os_init(void){
+  static sqlite3_vfs riscosVfs = {
+    3,                      /* iVersion */
+    sizeof(riscosFile),     /* szOsFile */
+    MAX_PATHNAME,           /* mxPathname */
+    0,                      /* pNext */
+    "riscos",               /* zName */
+    &riscosAppData,         /* pAppData */
+    riscosOpen,             /* xOpen */
+    riscosDelete,           /* xDelete */
+    riscosAccess,           /* xAccess */
+    riscosFullPathname,     /* xFullPathname */
+    riscosDlOpen,           /* xDlOpen */
+    riscosDlError,          /* xDlError */
+    riscosDlSym,            /* xDlSym */
+    riscosDlClose,          /* xDlClose */
+    riscosRandomness,       /* xRandomness */
+    riscosSleep,            /* xSleep */
+    riscosCurrentTime,      /* xCurrentTime */
+    riscosGetLastError,     /* xGetLastError */
+    riscosCurrentTimeInt64, /* xCurrentTimeInt64 */
+  };
+
+  sqlite3_vfs_register(&riscosVfs, 1);
+  return SQLITE_OK;
+}
+
+/*
+** Shutdown the operating system interface.
+**
+** Some operating systems might need to do some cleanup in this routine,
+** to release dynamically allocated objects.  But not on RISC OS.
+** This routine is a no-op for RISC OS.
+*/
+int sqlite3_os_end(void){
+  return SQLITE_OK;
+}
+
+#endif /* __riscos */

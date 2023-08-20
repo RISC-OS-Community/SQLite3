@@ -1,0 +1,64 @@
+#include <stdio.h>
+#include <string.h>
+
+const char *unixend = "/************** End of os_unix.c *********************************************/\n";
+const char *include = "#include \"os_common.h\"\n";
+const char *commonstart = "/************** Begin file os_common.h ***************************************/\n";
+const char *commonend = "/************** End of os_common.h *******************************************/\n";
+const char *rostart = "/************** Begin file os_riscos.c ***************************************/\n";
+const char *roend = "/************** End of os_riscos.c *******************************************/\n";
+
+int main(int argc, const char * argv[]) {
+    char line[1024];
+    FILE *original = fopen("c.sqlite3-in", "r");
+    FILE *new = fopen("c.sqlite3", "w");
+    
+    while (fgets(line, sizeof(line), original) != NULL)
+    {
+        fputs(line, new);
+        
+        if (strcmp(line, commonstart) == 0)
+        {
+            // Extract os_common so we can embed it later.
+            FILE *common = fopen("h.os_common", "w");
+            fputs(commonstart, common);
+            while (strcmp(line, commonend) != 0)
+            {
+                fgets(line, sizeof(line), original);
+                fputs(line, common);
+                fputs(line, new);
+            }
+            fclose(common);
+        }
+        
+        if (strcmp(line, unixend) == 0)
+        {
+            // This is where we need to embed os_riscos.
+            fputs(rostart, new);
+            FILE *riscos = fopen("c.os_riscos", "r");
+            while (fgets(line, sizeof(line), riscos) != NULL)
+            {
+                if (strcmp(line, include) == 0)
+                {
+                    // This is where we need to embed os_common.
+                    FILE *common = fopen("h.os_common", "r");
+                    while (fgets(line, sizeof(line), common) != NULL)
+                    {
+                        fputs(line, new);
+                    }
+                    fclose(common);
+                    remove("h.os_common");
+                }
+                else
+                {
+                    fputs(line, new);
+                }
+            }
+            fclose(riscos);
+            fputs(roend, new);
+        }
+    }
+    fclose(original);
+    
+    return 0;
+}

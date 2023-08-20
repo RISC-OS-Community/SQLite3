@@ -1,0 +1,47 @@
+COMPONENT       = SQLite
+TARGET          = sqlite3
+OBJS            = shell sqlite3
+CDEFINES        = -DSQLITE_OS_OTHER \
+                  -DSQLITE_OMIT_LOAD_EXTENSION \
+                  -DSQLITE_DQS=0 \
+                  -DSQLITE_THREADSAFE=0 \
+                  -DSQLITE_DEFAULT_MEMSTATUS=0 \
+                  -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1 \
+                  -DSQLITE_LIKE_DOESNT_MATCH_BLOBS \
+                  -DSQLITE_MAX_EXPR_DEPTH=0 \
+                  -DSQLITE_OMIT_DECLTYPE \
+                  -DSQLITE_OMIT_DEPRECATED \
+                  -DSQLITE_OMIT_PROGRESS_CALLBACK \
+                  -DSQLITE_OMIT_SHARED_CACHE \
+                  -DSQLITE_OMIT_AUTOINIT \
+                  -DSQLITE_HAVE_ISNAN \
+                  -DSQLITE_MIXED_ENDIAN_64BIT_FLOAT \
+                  -DSQLITE_OMIT_POPEN \
+                  -DSQLITE_ENABLE_EXPLAIN_COMMENTS \
+                  -DSQLITE_HAVE_ZLIB \
+                  -DSQLITE_INTROSPECTION_PRAGMAS \
+                  -DSQLITE_ENABLE_UNKNOWN_SQL_FUNCTION \
+                  -DSQLITE_ENABLE_STMTVTAB \
+                  -DSQLITE_ENABLE_DBPAGE_VTAB \
+                  -DSQLITE_ENABLE_DBSTAT_VTAB \
+                  -DSQLITE_ENABLE_OFFSET_SQL_FUNC \
+                  -DSQLITE_ENABLE_JSON1 \
+                  -DSQLITE_ENABLE_RTREE \
+                  -DSQLITE_ENABLE_FTS4 \
+                  -DSQLITE_ENABLE_FTS5
+CINCLUDES       = -IC:,OSLib:,C:zlib
+CFLAGS         += -ec -zpz0
+LIBS            = C:zlib.o.zlib
+INSTDIR        ?= <Install$Dir>
+INSTAPP_DEPENDS = datafiles
+INSTAPP_FILES   = !Boot !Run ${TARGET} !Sprites !Sprites11 !Sprites22 !Help Banner CSS
+
+include CApp
+
+C_WARNINGS = -fa
+
+datafiles:
+        ${MKDIR} ${INSTAPP}${SEP}h
+        ${MKDIR} ${INSTAPP}${SEP}o
+        ${CP} h ${INSTAPP}${SEP}h ${CPFLAGS}
+        ${CP} o${SEP}lib* ${INSTAPP}${SEP}o${SEP}* ${CPFLAGS}
